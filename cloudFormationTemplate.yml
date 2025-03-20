@@ -13,6 +13,7 @@ Parameters:
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of an existing EC2 KeyPair
+    Default: java-spring-app-key
 
   InstanceType:
     Type: String
@@ -27,16 +28,25 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Description: VPC where the instances will be deployed
 
-  Subnets:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: List of subnets for the instances
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID for first zone"
+
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID for second zone"
+
+  SkipDeploymentGroup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true to skip creation of the deployment group
 
 Resources:
   # S3 bucket for deployment artifacts
   DeploymentBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub 'your-app-deployment-bucket-${Environment}'
       VersioningConfiguration:
         Status: Enabled
       LifecycleConfiguration:
@@ -59,6 +69,18 @@ Resources:
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
         - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DeploymentBucket.Arn
+                  - !Sub '${DeploymentBucket.Arn}/*'
 
   # Instance profile for EC2 instances
   InstanceProfile:
@@ -82,18 +104,47 @@ Resources:
           FromPort: 8080
           ToPort: 8080
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub 'instance-sg-${Environment}'
+
+  # Security group for ALB
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
+          FromPort: 80
+          ToPort: 80
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub 'alb-sg-${Environment}'
+
+  # Add ingress rule for instances to allow traffic from ALB
+  InstanceSGIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: "Allow traffic from ALB"
 
   # Application load balancer
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Subnets: !Ref Subnets
+      Name: !Sub 'java-spring-alb-${Environment}'
+      Scheme: internet-facing
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
       SecurityGroups:
-        - !Ref InstanceSecurityGroup
+        - !Ref ALBSecurityGroup
       Tags:
         - Key: Name
           Value: !Sub 'java-spring-alb-${Environment}'
@@ -102,6 +153,7 @@ Resources:
   BlueTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      Name: !Sub 'blue-tg-${Environment}'
       HealthCheckPath: /actuator/health
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 5
@@ -113,12 +165,13 @@ Resources:
       VpcId: !Ref VpcId
       Tags:
         - Key: Name
-          Value: !Sub 'blue-target-group-${Environment}'
+          Value: !Sub 'blue-tg-${Environment}'
 
   # Load balancer target group - Green
   GreenTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      Name: !Sub 'green-tg-${Environment}'
       HealthCheckPath: /actuator/health
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 5
@@ -130,7 +183,7 @@ Resources:
       VpcId: !Ref VpcId
       Tags:
         - Key: Name
-          Value: !Sub 'green-target-group-${Environment}'
+          Value: !Sub 'green-tg-${Environment}'
 
   # ALB Listener
   LoadBalancerListener:
@@ -143,51 +196,48 @@ Resources:
       Port: 80
       Protocol: HTTP
 
-  # AutoScaling Group - Blue
-  BlueAutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      VPCZoneIdentifier: !Ref Subnets
-      LaunchTemplate:
-        LaunchTemplateId: !Ref InstanceLaunchTemplate
-        Version: !GetAtt InstanceLaunchTemplate.LatestVersionNumber
-      MinSize: 1
-      MaxSize: 4
-      DesiredCapacity: 2
-      TargetGroupARNs:
-        - !Ref BlueTargetGroup
-      Tags:
-        - Key: Name
-          Value: !Sub 'asg-blue-${Environment}'
-          PropagateAtLaunch: true
-
   # Launch template for EC2 instances
   InstanceLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
-      LaunchTemplateName: !Sub 'java-spring-launch-template-${Environment}'
+      LaunchTemplateName: !Sub 'java-spring-lt-${Environment}'
       VersionDescription: Initial version
       LaunchTemplateData:
-        ImageId: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI, update as needed
+        ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
         IamInstanceProfile:
           Name: !Ref InstanceProfile
         SecurityGroupIds:
           - !Ref InstanceSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'java-spring-instance-${Environment}'
+              - Key: Environment
+                Value: !Ref Environment
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash -xe
+            #!/bin/bash
+            set -e
+            
+            # Update system packages
             yum update -y
-            amazon-linux-extras install java-openjdk11 -y
+            
+            # Install Java 11
+            amazon-linux-extras install -y java-openjdk11
+            
+            # Install CodeDeploy agent
             yum install -y ruby wget
             cd /home/ec2-user
-            wget https://aws-codedeploy-us-east-1.s3.amazonaws.com/latest/install
+            wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
             chmod +x ./install
             ./install auto
             
             # Create application directory
             mkdir -p /opt/spring-app
+            chown -R ec2-user:ec2-user /opt/spring-app
             
             # Add startup script
             cat > /etc/systemd/system/spring-app.service << 'EOF'
@@ -200,14 +250,69 @@ Resources:
             User=ec2-user
             WorkingDirectory=/opt/spring-app
             ExecStart=/usr/bin/java -jar /opt/spring-app/app.jar
+            SuccessExitStatus=143
+            TimeoutStopSec=10
+            Restart=on-failure
+            RestartSec=5
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Enable service but don't start it yet
+            systemctl daemon-reload
+            systemctl enable spring-app
+            
+            # Create default health check endpoint
+            mkdir -p /opt/spring-app/actuator/health
+            echo '{"status":"UP"}' > /opt/spring-app/actuator/health/index.html
+            
+            # Create temporary web server for health checks
+            cat > /etc/systemd/system/health-server.service << 'EOF'
+            [Unit]
+            Description=Temporary Health Check Server
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=ec2-user
+            WorkingDirectory=/opt/spring-app
+            ExecStart=/usr/bin/python -m SimpleHTTPServer 8080
             Restart=on-failure
             
             [Install]
             WantedBy=multi-user.target
             EOF
             
-            systemctl enable spring-app
-            systemctl start spring-app
+            systemctl daemon-reload
+            systemctl enable health-server
+            systemctl start health-server
+
+  # AutoScaling Group - Blue
+  BlueAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'blue-asg-${Environment}'
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref InstanceLaunchTemplate
+        Version: !GetAtt InstanceLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 4
+      DesiredCapacity: 2
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs:
+        - !Ref BlueTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'blue-asg-${Environment}'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
 
   # CodeDeploy Application
   CodeDeployApplication:
@@ -216,16 +321,42 @@ Resources:
       ApplicationName: !Sub 'java-spring-app-${Environment}'
       ComputePlatform: Server
 
+  # CodeDeploy Service Role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole'
+      Policies:
+        - PolicyName: CodeDeployPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticloadbalancing:*'
+                  - 'autoscaling:*'
+                  - 'ec2:*'
+                Resource: '*'
+
   # CodeDeploy Deployment Group for Blue/Green deployment
   DeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: CreateDeploymentGroup
+    DependsOn:
+      - BlueAutoScalingGroup
+      - LoadBalancerListener
     Properties:
       ApplicationName: !Ref CodeDeployApplication
       DeploymentGroupName: !Sub '${Environment}-deployment-group'
-      DeploymentConfigName: !If
-        - IsProduction
-        - CodeDeployDefault.BlueGreen
-        - CodeDeployDefault.AllAtOnce
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
       ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
       DeploymentStyle:
         DeploymentType: BLUE_GREEN
@@ -239,29 +370,20 @@ Resources:
         TerminateBlueInstancesOnDeploymentSuccess:
           Action: TERMINATE
           TerminationWaitTimeInMinutes: 60
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref LoadBalancerListener
+            TargetGroups:
+              - Name: !GetAtt BlueTargetGroup.TargetGroupName
+              - Name: !GetAtt GreenTargetGroup.TargetGroupName
       AutoScalingGroups:
         - !Ref BlueAutoScalingGroup
-      LoadBalancerInfo:
-        TargetGroupInfoList:
-          - Name: !GetAtt BlueTargetGroup.TargetGroupName
-          - Name: !GetAtt GreenTargetGroup.TargetGroupName
-
-  # IAM role for CodeDeploy
-  CodeDeployServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codedeploy.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole'
 
 Conditions:
   IsProduction: !Equals [!Ref Environment, 'production']
+  CreateDeploymentGroup: !Equals [!Ref SkipDeploymentGroup, "false"]
 
 Outputs:
   LoadBalancerDNS:
@@ -278,4 +400,4 @@ Outputs:
 
   DeploymentGroupName:
     Description: CodeDeploy deployment group name
-    Value: !Ref DeploymentGroup
+    Value: !If [CreateDeploymentGroup, !Ref DeploymentGroup, "Deployment group was skipped"]
